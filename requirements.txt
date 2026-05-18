@@ -1,3 +1,4 @@
+
 # Mountain Path Academy · Time Series Forecasting App
 # ---------------------------------------------------
 # Install:    pip install -r requirements.txt
@@ -13,6 +14,10 @@ plotly>=5.20,<7.0
 # Required by Streamlit's file_uploader / dataframe styling.
 # (Pinned loosely so pip can resolve a compatible version with pandas.)
 pyarrow>=15.0
+
+# Excel upload support
+openpyxl>=3.1     # for .xlsx files (modern Excel)
+xlrd>=2.0         # for legacy .xls files
 
 # Optional, but greatly improves dataframe styling colour gradients:
 matplotlib>=3.7
