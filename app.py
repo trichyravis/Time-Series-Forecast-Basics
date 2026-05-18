@@ -368,6 +368,126 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Load data
 # ---------------------------------------------------------------------------
+def _parse_dates_robustly(s: pd.Series, fmt_override: str | None = None):
+    """Try hard to parse a column of dates.
+
+    Strategy (stops at first that succeeds for ≥90% of non-null rows):
+      1. Already datetime → use as-is.
+      2. User-supplied strftime format.
+      3. pandas default (ISO-ish, with infer_datetime_format).
+      4. dayfirst=True (DD/MM/YYYY, DD-MM-YYYY).
+      5. format='mixed' (pandas ≥ 2.0 — accepts heterogeneous rows).
+      6. Excel serial number (numeric columns: 10000..80000 typical range).
+      7. A curated list of common explicit formats.
+
+    Returns
+    -------
+    (parsed_series, info_dict)
+        info_dict keys: method, total, bad, sample, tried
+    """
+    total = len(s)
+    tried: list[str] = []
+
+    def _attempt(label, parsed) -> tuple[pd.Series, dict] | None:
+        bad = parsed.isna().sum()
+        # consider success if at least 90% of non-null rows parsed,
+        # or if all originally non-null rows parsed.
+        nonnull_orig = s.notna().sum()
+        good = nonnull_orig - bad
+        if nonnull_orig > 0 and good / nonnull_orig >= 0.90:
+            return parsed, {"method": label, "total": total, "bad": int(bad),
+                            "sample": list(map(str, s.head(3).tolist())),
+                            "tried": tried}
+        return None
+
+    # 1. already datetime
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s, {"method": "already datetime", "total": total, "bad": 0,
+                   "sample": list(map(str, s.head(3).tolist())), "tried": []}
+
+    # 2. user override (always wins if provided)
+    if fmt_override:
+        tried.append(f"format='{fmt_override}'")
+        try:
+            parsed = pd.to_datetime(s, format=fmt_override, errors="coerce")
+            r = _attempt(f"explicit format '{fmt_override}'", parsed)
+            if r: return r
+        except Exception:
+            pass
+
+    # 3. NUMERIC column → treat as Excel serial number FIRST
+    # (otherwise pd.to_datetime would interpret it as nanoseconds since epoch)
+    if pd.api.types.is_numeric_dtype(s):
+        tried.append("excel-serial")
+        try:
+            base = pd.Timestamp("1899-12-30")  # Excel 1900 system epoch
+            parsed = base + pd.to_timedelta(s.astype(float), unit="D")
+            if parsed.dt.year.dropna().between(1950, 2099).all():
+                return parsed, {"method": "Excel serial number",
+                                "total": total, "bad": 0,
+                                "sample": list(map(str, s.head(3).tolist())),
+                                "tried": tried}
+        except Exception:
+            pass
+        # numeric but not a sensible serial → bail to row index
+        fallback = pd.Series(pd.RangeIndex(start=0, stop=total), name=s.name)
+        return fallback, {"method": "row_index", "total": total, "bad": total,
+                          "sample": list(map(str, s.head(3).tolist())),
+                          "tried": tried}
+
+    # 4. default auto-detect for strings
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        tried.append("auto")
+        try:
+            parsed = pd.to_datetime(s, errors="coerce")
+            r = _attempt("auto-detect", parsed)
+            if r: return r
+        except Exception:
+            pass
+
+        # 5. dayfirst (European)
+        tried.append("dayfirst=True")
+        try:
+            parsed = pd.to_datetime(s, errors="coerce", dayfirst=True)
+            r = _attempt("dayfirst (DD/MM/YYYY)", parsed)
+            if r: return r
+        except Exception:
+            pass
+
+        # 6. format='mixed' (pandas 2.x)
+        tried.append("format='mixed'")
+        try:
+            parsed = pd.to_datetime(s, errors="coerce", format="mixed",
+                                    dayfirst=True)
+            r = _attempt("mixed-format", parsed)
+            if r: return r
+        except Exception:
+            pass
+
+    # 7. common explicit formats
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
+                "%d/%m/%y", "%d-%m-%y",
+                "%d-%b-%Y", "%d %b %Y", "%d-%B-%Y", "%d %B %Y",
+                "%b-%y", "%b %Y", "%B %Y",
+                "%Y%m%d", "%Y-%m-%d", "%Y/%m/%d",
+                "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"):
+        tried.append(f"'{fmt}'")
+        try:
+            parsed = pd.to_datetime(s, format=fmt, errors="coerce")
+            r = _attempt(f"explicit format '{fmt}'", parsed)
+            if r: return r
+        except Exception:
+            continue
+
+    # 8. give up — caller will warn and fall back to row index
+    fallback = pd.Series(pd.RangeIndex(start=0, stop=total), name=s.name)
+    return fallback, {"method": "row_index", "total": total, "bad": total,
+                      "sample": list(map(str, s.head(3).tolist())),
+                      "tried": tried}
+
+
 def _read_uploaded(file) -> pd.DataFrame:
     """Read an uploaded CSV / XLSX / XLS into a DataFrame.
 
@@ -426,16 +546,41 @@ if source == "Upload CSV or Excel" and uploaded is not None:
                 break
         value_col = st.selectbox("Value column", cols, index=default_val_idx)
 
+    # Optional manual date-format override for unusual layouts
+    date_fmt_override = st.text_input(
+        "Date format (optional override)",
+        value="",
+        placeholder="e.g. %d/%m/%Y, %d-%b-%Y, %Y%m%d",
+        help=("Leave blank to auto-detect. If auto-detection fails, type a "
+              "Python strftime pattern matching your dates. Examples: "
+              "%d/%m/%Y for 31/12/2024, %d-%b-%Y for 31-Dec-2024, "
+              "%Y%m%d for 20241231."),
+    ).strip()
+
     df = df_raw[[date_col, value_col]].copy()
     df.columns = ["date", "value"]
-    try:
-        df["date"] = pd.to_datetime(df["date"])
-    except Exception:
-        st.warning("Date column could not be parsed as datetime; "
-                   "using row index as the time axis.")
-        df["date"] = pd.RangeIndex(start=0, stop=len(df))
+    df["date"], parse_info = _parse_dates_robustly(df["date"], date_fmt_override or None)
+    if parse_info["method"] == "row_index":
+        st.warning(
+            f"Could not parse the **{date_col}** column as datetime "
+            f"(tried: {', '.join(parse_info['tried'])}). "
+            f"Sample values: {parse_info['sample']!r}. "
+            "Falling back to the row index. "
+            "Tip: type your date format in the override box above "
+            "(e.g. `%d/%m/%Y` for 31/12/2024)."
+        )
+    elif parse_info["bad"] > 0:
+        st.warning(
+            f"Parsed dates with method **{parse_info['method']}**, but "
+            f"{parse_info['bad']} of {parse_info['total']} values could not "
+            f"be read and were dropped."
+        )
+    else:
+        st.success(f"Dates parsed via **{parse_info['method']}** "
+                   f"({parse_info['total']} rows).")
+
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["value"]).reset_index(drop=True)
+    df = df.dropna(subset=["value", "date"]).reset_index(drop=True)
 
     if df.empty:
         st.error("After parsing, the value column had no numeric data.")
