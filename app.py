@@ -1,3 +1,4 @@
+
 """
 Time Series Forecasting App — Mountain Path Academy edition
 -----------------------------------------------------------
@@ -190,16 +191,41 @@ def error_metrics(actual: pd.Series, forecast: pd.Series) -> dict:
 
 
 def extend_index(idx: pd.Index, n_extra: int) -> pd.Index:
-    """Extend a DatetimeIndex / PeriodIndex / RangeIndex by n_extra periods."""
+    """Extend a DatetimeIndex / PeriodIndex / RangeIndex by n_extra periods.
+
+    Robust to indices whose frequency cannot be inferred (uploaded data with
+    near-regular but not exact spacing): we fall back to the median delta.
+    """
+    if n_extra <= 0:
+        return idx
+
     if isinstance(idx, pd.PeriodIndex):
         return pd.period_range(idx[0], periods=len(idx) + n_extra, freq=idx.freq)
+
     if isinstance(idx, pd.DatetimeIndex):
-        if idx.freq is None:
-            freq = pd.infer_freq(idx)
-        else:
-            freq = idx.freq
-        return pd.date_range(idx[0], periods=len(idx) + n_extra, freq=freq)
-    return pd.RangeIndex(start=int(idx[0]), stop=int(idx[0]) + len(idx) + n_extra)
+        freq = idx.freq or pd.infer_freq(idx)
+        if freq is not None:
+            try:
+                return pd.date_range(idx[0], periods=len(idx) + n_extra, freq=freq)
+            except Exception:
+                freq = None
+        # fallback: use median spacing — works for any near-regular series
+        if len(idx) >= 2:
+            deltas = np.diff(idx.view("int64"))
+            step_ns = int(np.median(deltas))
+            step = pd.Timedelta(step_ns, unit="ns")
+            future = pd.DatetimeIndex(
+                [idx[-1] + step * (k + 1) for k in range(n_extra)]
+            )
+            return idx.append(future)
+        return idx
+
+    # Numeric / RangeIndex fallback
+    try:
+        start = int(idx[0])
+    except Exception:
+        start = 0
+    return pd.RangeIndex(start=start, stop=start + len(idx) + n_extra)
 
 
 def run_pipeline(y: pd.Series, s: int, trend_method: str, model: str,
@@ -292,15 +318,20 @@ def default_dataset() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown(f"### Data source")
-    source = st.radio("", ["Default quarterly sales (synthetic)", "Upload my CSV"],
-                      label_visibility="collapsed")
+    source = st.radio(
+        "Data source",
+        ["Default quarterly sales (synthetic)", "Upload CSV or Excel"],
+        label_visibility="collapsed",
+    )
 
     uploaded = None
-    if source == "Upload my CSV":
+    if source == "Upload CSV or Excel":
         uploaded = st.file_uploader(
-            "CSV with a date column and a value column",
-            type=["csv"],
-            help="The app will let you pick which column is the date and which is the value.",
+            "CSV / XLSX / XLS — must have a date column and a value column",
+            type=["csv", "xlsx", "xls"],
+            help=("CSV or Excel file. For multi-sheet workbooks you'll get a "
+                  "sheet picker. Then map which column is the date and "
+                  "which is the value."),
         )
 
     st.markdown("---")
@@ -337,11 +368,49 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Load data
 # ---------------------------------------------------------------------------
-if source == "Upload my CSV" and uploaded is not None:
+def _read_uploaded(file) -> pd.DataFrame:
+    """Read an uploaded CSV / XLSX / XLS into a DataFrame.
+
+    For multi-sheet workbooks shows a sheet selector. Returns a flat
+    DataFrame; column selection happens downstream.
+    """
+    name = (file.name or "").lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(file)
+
+    if name.endswith((".xlsx", ".xls")):
+        engine = "openpyxl" if name.endswith(".xlsx") else "xlrd"
+        try:
+            xls = pd.ExcelFile(file, engine=engine)
+        except ImportError as e:
+            st.error(
+                f"Reading {name.split('.')[-1].upper()} files requires the "
+                f"`{engine}` package. Install it with `pip install {engine}` "
+                f"and restart the app.  ({e})"
+            )
+            st.stop()
+        sheet_names = xls.sheet_names
+        if len(sheet_names) == 1:
+            return xls.parse(sheet_names[0])
+        sheet = st.selectbox("Excel sheet", sheet_names, index=0,
+                             help="Workbook has multiple sheets — pick one.")
+        return xls.parse(sheet)
+
+    # Fallback: try CSV
+    file.seek(0)
+    return pd.read_csv(file)
+
+
+if source == "Upload CSV or Excel" and uploaded is not None:
     try:
-        df_raw = pd.read_csv(uploaded)
+        df_raw = _read_uploaded(uploaded)
     except Exception as e:
-        st.error(f"Could not read CSV: {e}")
+        st.error(f"Could not read file: {e}")
+        st.stop()
+
+    if df_raw.empty or len(df_raw.columns) < 2:
+        st.error("Uploaded file must have at least two columns "
+                 "(a date column and a value column).")
         st.stop()
 
     cols = list(df_raw.columns)
@@ -349,17 +418,31 @@ if source == "Upload my CSV" and uploaded is not None:
     with c1:
         date_col = st.selectbox("Date column", cols, index=0)
     with c2:
-        value_col = st.selectbox("Value column", cols,
-                                 index=1 if len(cols) > 1 else 0)
+        default_val_idx = 1 if len(cols) > 1 else 0
+        # If the obvious 2nd column is non-numeric, try to pick the first numeric one
+        for i, c in enumerate(cols):
+            if c != date_col and pd.api.types.is_numeric_dtype(df_raw[c]):
+                default_val_idx = i
+                break
+        value_col = st.selectbox("Value column", cols, index=default_val_idx)
+
     df = df_raw[[date_col, value_col]].copy()
     df.columns = ["date", "value"]
     try:
         df["date"] = pd.to_datetime(df["date"])
     except Exception:
-        st.warning("Date column could not be parsed as datetime; using row index as the time axis.")
+        st.warning("Date column could not be parsed as datetime; "
+                   "using row index as the time axis.")
         df["date"] = pd.RangeIndex(start=0, stop=len(df))
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df = df.dropna(subset=["value"]).reset_index(drop=True)
+
+    if df.empty:
+        st.error("After parsing, the value column had no numeric data.")
+        st.stop()
+
+    with st.expander("Preview uploaded data (first 10 rows)"):
+        st.dataframe(df.head(10), use_container_width=True, hide_index=True)
 else:
     df = default_dataset()
 
@@ -383,11 +466,17 @@ def _run(model: str) -> dict:
     fc_horizon = horizon + n_hold
     out = run_pipeline(y_train, s=int(s), trend_method=trend_method_short,
                        model=model, horizon=fc_horizon)
-    # back-test metrics on the hold-out
-    if n_hold > 0:
-        f_hold = out["fitted"].loc[y_test.index] if not y_test.empty else pd.Series(dtype=float)
+    # back-test metrics on the hold-out, indexed positionally so the labels
+    # of the rebuilt forecast timeline don't need to match y_test's index
+    if n_hold > 0 and not y_test.empty:
+        n_train = out["n_train"]
+        # the first n_hold points of the future portion correspond to y_test
+        f_hold_vals = out["fitted"].iloc[n_train: n_train + len(y_test)].values
+        f_hold = pd.Series(f_hold_vals, index=y_test.index, name="forecast")
+        out["holdout_forecast"] = f_hold
         out["holdout_metrics"] = error_metrics(y_test, f_hold)
     else:
+        out["holdout_forecast"] = pd.Series(dtype=float)
         out["holdout_metrics"] = {"MAE": np.nan, "MAD": np.nan, "RMSE": np.nan,
                                   "MAPE_%": np.nan, "n": 0}
     return out
@@ -594,9 +683,14 @@ if len(runs) > 1:
 # ---------------------------------------------------------------------------
 st.markdown("## Export")
 first_run = runs[list(runs.keys())[0]]
+# Build the actual column positionally — robust to rebuilt timelines whose
+# labels may not exactly match the source y.index
+full_idx = first_run["full_index"]
+actual_col = np.full(len(full_idx), np.nan, dtype=float)
+actual_col[: len(y)] = y.values
 export_df = pd.DataFrame({
-    "date": first_run["full_index"],
-    "actual": y.reindex(first_run["full_index"]).values,
+    "date": full_idx,
+    "actual": actual_col,
     "trend": first_run["trend"].values,
     "forecast": first_run["fitted"].values,
 })
